@@ -94,7 +94,11 @@ def login_url(login_view, next_url=None, next_field='next'):
     Creates a URL for redirecting to a login page. If only `login_view` is
     provided, this will just return the URL for it. If `next_url` is provided,
     however, this will append a ``next=URL`` parameter to the query string
-    so that the login view can redirect back to that URL.
+    so that the login view can redirect back to that URL. Flask-Login's default
+    unauthorized handler uses this function when redirecting to your login url.
+    To force the host name used, set `FORCE_HOST_FOR_REDIRECTS` to a host. This
+    prevents from redirecting to external sites if request headers Host or
+    X-Forwarded-For are present.
 
     :param login_view: The name of the login view. (Alternately, the actual
                        URL to the login view.)
@@ -113,7 +117,10 @@ def login_url(login_view, next_url=None, next_field='next'):
     parsed_result = urlparse(base)
     md = url_decode(parsed_result.query)
     md[next_field] = make_next_param(base, next_url)
-    parsed_result = parsed_result._replace(query=url_encode(md, sort=True))
+    netloc = current_app.config.get('FORCE_HOST_FOR_REDIRECTS') or \
+        parsed_result.netloc
+    parsed_result = parsed_result._replace(netloc=netloc,
+                                           query=url_encode(md, sort=True))
     return urlunparse(parsed_result)
 
 
@@ -124,7 +131,7 @@ def login_fresh():
     return session.get('_fresh', False)
 
 
-def login_user(user, remember=False, force=False, fresh=True):
+def login_user(user, remember=False, duration=None, force=False, fresh=True):
     '''
     Logs a user in. You should pass the actual user object to this. If the
     user's `is_active` property is ``False``, they will not be logged in
@@ -138,6 +145,9 @@ def login_user(user, remember=False, force=False, fresh=True):
     :param remember: Whether to remember the user after their session expires.
         Defaults to ``False``.
     :type remember: bool
+    :param duration: The amount of time before the remember cookie expires. If
+        ``None`` the value set in the settings is used. Defaults to ``None``.
+    :type duration: :class:`datetime.timedelta`
     :param force: If the user is inactive, setting this to ``True`` will log
         them in regardless. Defaults to ``False``.
     :type force: bool
@@ -155,8 +165,18 @@ def login_user(user, remember=False, force=False, fresh=True):
 
     if remember:
         session['remember'] = 'set'
+        if duration is not None:
+            try:
+                # equal to timedelta.total_seconds() but works with Python 2.6
+                session['remember_seconds'] = (duration.microseconds +
+                                               (duration.seconds +
+                                                duration.days * 24 * 3600) *
+                                               10**6) / 10.0**6
+            except AttributeError:
+                raise Exception('duration must be a datetime.timedelta, '
+                                'instead got: {0}'.format(duration))
 
-    _request_ctx_stack.top.user = user
+    current_app.login_manager._update_request_context_with_user(user)
     user_logged_in.send(current_app._get_current_object(), user=_get_user())
     return True
 
@@ -178,10 +198,12 @@ def logout_user():
     cookie_name = current_app.config.get('REMEMBER_COOKIE_NAME', COOKIE_NAME)
     if cookie_name in request.cookies:
         session['remember'] = 'clear'
+        if 'remember_seconds' in session:
+            session.pop('remember_seconds')
 
     user_logged_out.send(current_app._get_current_object(), user=user)
 
-    current_app.login_manager.reload_user()
+    current_app.login_manager._update_request_context_with_user()
     return True
 
 

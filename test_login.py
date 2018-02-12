@@ -8,7 +8,7 @@ import base64
 import collections
 from datetime import timedelta, datetime
 from contextlib import contextmanager
-from mock import ANY
+from mock import ANY, patch, Mock
 from semantic_version import Version
 
 
@@ -117,7 +117,7 @@ USERS = {1: notch, 2: steve, 3: creeper, u'佐藤': germanjapanese}
 
 
 class AboutTestCase(unittest.TestCase):
-    """Make sure we can get version and other info."""
+    '''Make sure we can get version and other info.'''
 
     def test_have_about_data(self):
         self.assertTrue(__title__ is not None)
@@ -141,6 +141,10 @@ class StaticTestCase(unittest.TestCase):
         lm = LoginManager()
         lm.init_app(app)
 
+        @lm.user_loader
+        def load_user(user_id):
+            return USERS[int(user_id)]
+
         with app.test_client() as c:
             c.get('/static/favicon.ico')
             self.assertTrue(current_user.is_anonymous)
@@ -151,6 +155,10 @@ class StaticTestCase(unittest.TestCase):
         app.secret_key = 'this is a temp key'
         lm = LoginManager()
         lm.init_app(app)
+
+        @lm.user_loader
+        def load_user(user_id):
+            return USERS[int(user_id)]
 
         with app.test_client() as c:
             with listen_to(user_accessed) as listener:
@@ -185,10 +193,9 @@ class InitializationTestCase(unittest.TestCase):
         with self.app.test_request_context():
             session['user_id'] = '2'
             with self.assertRaises(Exception) as cm:
-                login_manager.reload_user()
-            expected_exception_message = 'No user_loader has been installed'
-            self.assertTrue(
-                str(cm.exception).startswith(expected_exception_message))
+                login_manager._load_user()
+            expected_message = 'Missing user_loader or request_loader'
+            self.assertTrue(str(cm.exception).startswith(expected_message))
 
 
 class MethodViewLoginTestCase(unittest.TestCase):
@@ -247,6 +254,11 @@ class LoginTestCase(unittest.TestCase):
         @self.app.route('/login-notch-remember')
         def login_notch_remember():
             return unicode(login_user(notch, remember=True))
+
+        @self.app.route('/login-notch-remember-custom')
+        def login_notch_remember_custom():
+            duration = timedelta(hours=7)
+            return unicode(login_user(notch, remember=True, duration=duration))
 
         @self.app.route('/login-notch-permanent')
         def login_notch_permanent():
@@ -313,10 +325,6 @@ class LoginTestCase(unittest.TestCase):
 
         unittest.TestCase.setUp(self)
 
-    def _get_remember_cookie(self, test_client):
-        our_cookies = test_client.cookie_jar._cookies['localhost.local']['/']
-        return our_cookies[self.remember_cookie_name]
-
     def _delete_session(self, c):
         # Helper method to cause the session to be deleted
         # as if the browser was closed. This will remove
@@ -370,7 +378,7 @@ class LoginTestCase(unittest.TestCase):
     def test_login_user_with_header(self):
         user_id = 2
         user_name = USERS[user_id].name
-        self.login_manager.request_callback = None
+        self.login_manager._request_callback = None
         with self.app.test_client() as c:
             basic_fmt = 'Basic {0}'
             decoded = bytes.decode(base64.b64encode(str.encode(str(user_id))))
@@ -381,7 +389,7 @@ class LoginTestCase(unittest.TestCase):
     def test_login_invalid_user_with_header(self):
         user_id = 9000
         user_name = u'Anonymous'
-        self.login_manager.request_callback = None
+        self.login_manager._request_callback = None
         with self.app.test_client() as c:
             basic_fmt = 'Basic {0}'
             decoded = bytes.decode(base64.b64encode(str.encode(str(user_id))))
@@ -635,6 +643,13 @@ class LoginTestCase(unittest.TestCase):
             result = c.get('/username')
             self.assertEqual(u'Notch', result.data.decode('utf-8'))
 
+    def test_remember_me_custom_duration(self):
+        with self.app.test_client() as c:
+            c.get('/login-notch-remember-custom')
+            self._delete_session(c)
+            result = c.get('/username')
+            self.assertEqual(u'Notch', result.data.decode('utf-8'))
+
     def test_remember_me_uses_custom_cookie_parameters(self):
         name = self.app.config['REMEMBER_COOKIE_NAME'] = 'myname'
         duration = self.app.config['REMEMBER_COOKIE_DURATION'] = \
@@ -665,15 +680,76 @@ class LoginTestCase(unittest.TestCase):
             self.assertLess(difference, timedelta(seconds=10), fail_msg)
             self.assertGreater(difference, timedelta(seconds=-10), fail_msg)
 
+    def test_remember_me_custom_duration_uses_custom_cookie(self):
+        name = self.app.config['REMEMBER_COOKIE_NAME'] = 'myname'
+        self.app.config['REMEMBER_COOKIE_DURATION'] = 172800
+        duration = timedelta(hours=7)
+        path = self.app.config['REMEMBER_COOKIE_PATH'] = '/mypath'
+        domain = self.app.config['REMEMBER_COOKIE_DOMAIN'] = '.localhost.local'
+
+        with self.app.test_client() as c:
+            c.get('/login-notch-remember-custom')
+
+            # TODO: Is there a better way to test this?
+            self.assertIn(domain, c.cookie_jar._cookies,
+                          'Custom domain not found as cookie domain')
+            domain_cookie = c.cookie_jar._cookies[domain]
+            self.assertIn(path, domain_cookie,
+                          'Custom path not found as cookie path')
+            path_cookie = domain_cookie[path]
+            self.assertIn(name, path_cookie,
+                          'Custom name not found as cookie name')
+            cookie = path_cookie[name]
+
+            expiration_date = datetime.utcfromtimestamp(cookie.expires)
+            expected_date = datetime.utcnow() + duration
+            difference = expected_date - expiration_date
+
+            fail_msg = 'The expiration date {0} was far from the expected {1}'
+            fail_msg = fail_msg.format(expiration_date, expected_date)
+            self.assertLess(difference, timedelta(seconds=10), fail_msg)
+            self.assertGreater(difference, timedelta(seconds=-10), fail_msg)
+
+    def test_remember_me_accepts_duration_as_int(self):
+        self.app.config['REMEMBER_COOKIE_DURATION'] = 172800
+        duration = timedelta(seconds=172800)
+        name = self.app.config['REMEMBER_COOKIE_NAME'] = 'myname'
+        domain = self.app.config['REMEMBER_COOKIE_DOMAIN'] = '.localhost.local'
+
+        with self.app.test_client() as c:
+            result = c.get('/login-notch-remember')
+            self.assertEqual(result.status_code, 200)
+
+            cookie = c.cookie_jar._cookies[domain]['/'][name]
+
+            expiration_date = datetime.utcfromtimestamp(cookie.expires)
+            expected_date = datetime.utcnow() + duration
+            difference = expected_date - expiration_date
+
+            fail_msg = 'The expiration date {0} was far from the expected {1}'
+            fail_msg = fail_msg.format(expiration_date, expected_date)
+            self.assertLess(difference, timedelta(seconds=10), fail_msg)
+            self.assertGreater(difference, timedelta(seconds=-10), fail_msg)
+
     def test_remember_me_with_invalid_duration_returns_500_response(self):
-        self.app.config['REMEMBER_COOKIE_DURATION'] = 123
+        self.app.config['REMEMBER_COOKIE_DURATION'] = '123'
 
         with self.app.test_client() as c:
             result = c.get('/login-notch-remember')
             self.assertEqual(result.status_code, 500)
 
+    def test_remember_me_with_invalid_custom_duration_returns_500_resp(self):
+        @self.app.route('/login-notch-remember-custom-invalid')
+        def login_notch_remember_custom_invalid():
+            duration = '123'
+            return unicode(login_user(notch, remember=True, duration=duration))
+
+        with self.app.test_client() as c:
+            result = c.get('/login-notch-remember-custom-invalid')
+            self.assertEqual(result.status_code, 500)
+
     def test_set_cookie_with_invalid_duration_raises_exception(self):
-        self.app.config['REMEMBER_COOKIE_DURATION'] = 123
+        self.app.config['REMEMBER_COOKIE_DURATION'] = '123'
 
         with self.assertRaises(Exception) as cm:
             with self.app.test_request_context():
@@ -683,6 +759,58 @@ class LoginTestCase(unittest.TestCase):
         expected_exception_message = 'REMEMBER_COOKIE_DURATION must be a ' \
             'datetime.timedelta, instead got: 123'
         self.assertIn(expected_exception_message, str(cm.exception))
+
+    def test_set_cookie_with_invalid_custom_duration_raises_exception(self):
+        with self.assertRaises(Exception) as cm:
+            with self.app.test_request_context():
+                login_user(notch, remember=True, duration='123')
+
+        expected_exception_message = 'duration must be a ' \
+            'datetime.timedelta, instead got: 123'
+        self.assertIn(expected_exception_message, str(cm.exception))
+
+    def test_remember_me_refresh_every_request(self):
+        domain = self.app.config['REMEMBER_COOKIE_DOMAIN'] = '.localhost.local'
+        path = self.app.config['REMEMBER_COOKIE_PATH'] = '/'
+
+        # No refresh
+        self.app.config['REMEMBER_COOKIE_REFRESH_EACH_REQUEST'] = False
+        with self.app.test_client() as c:
+            c.get('/login-notch-remember')
+            self.assertIn('remember', c.cookie_jar._cookies[domain][path])
+            expiration_date_1 = datetime.utcfromtimestamp(
+                c.cookie_jar._cookies[domain][path]['remember'].expires)
+
+            self._delete_session(c)
+
+            c.get('/username')
+            self.assertIn('remember', c.cookie_jar._cookies[domain][path])
+            expiration_date_2 = datetime.utcfromtimestamp(
+                c.cookie_jar._cookies[domain][path]['remember'].expires)
+            self.assertEqual(expiration_date_1, expiration_date_2)
+
+        # With refresh (mock datetime's `utcnow`)
+        with patch('flask_login.login_manager.datetime') as mock_dt:
+            self.app.config['REMEMBER_COOKIE_REFRESH_EACH_REQUEST'] = True
+            now = datetime.utcnow()
+            mock_dt.utcnow = Mock(return_value=now)
+
+            with self.app.test_client() as c:
+                c.get('/login-notch-remember')
+                self.assertIn('remember', c.cookie_jar._cookies[domain][path])
+                expiration_date_1 = datetime.utcfromtimestamp(
+                    c.cookie_jar._cookies[domain][path]['remember'].expires)
+                self.assertIsNotNone(expiration_date_1)
+
+                self._delete_session(c)
+
+                mock_dt.utcnow = Mock(return_value=now + timedelta(seconds=1))
+                c.get('/username')
+                self.assertIn('remember', c.cookie_jar._cookies[domain][path])
+                expiration_date_2 = datetime.utcfromtimestamp(
+                    c.cookie_jar._cookies[domain][path]['remember'].expires)
+                self.assertIsNotNone(expiration_date_2)
+                self.assertNotEqual(expiration_date_1, expiration_date_2)
 
     def test_remember_me_is_unfresh(self):
         with self.app.test_client() as c:
@@ -724,7 +852,7 @@ class LoginTestCase(unittest.TestCase):
     def test_user_loaded_from_header_fired(self):
         user_id = 1
         user_name = USERS[user_id].name
-        self.login_manager.request_callback = None
+        self.login_manager._request_callback = None
         with self.app.test_client() as c:
             with listen_to(user_loaded_from_header) as listener:
                 headers = [
@@ -753,6 +881,13 @@ class LoginTestCase(unittest.TestCase):
     def test_logout_stays_logged_out_with_remember_me(self):
         with self.app.test_client() as c:
             c.get('/login-notch-remember')
+            c.get('/logout')
+            result = c.get('/username')
+            self.assertEqual(result.data.decode('utf-8'), u'Anonymous')
+
+    def test_logout_stays_logged_out_with_remember_me_custom_duration(self):
+        with self.app.test_client() as c:
+            c.get('/login-notch-remember-custom')
             c.get('/logout')
             result = c.get('/username')
             self.assertEqual(result.data.decode('utf-8'), u'Anonymous')
@@ -865,6 +1000,16 @@ class LoginTestCase(unittest.TestCase):
             # "after_request" handlers that call _update_remember_cookie.
             # Ensure that if nothing changed the session is not modified.
             self.assertFalse(session.modified)
+
+    def test_invalid_remember_cookie(self):
+        domain = self.app.config['REMEMBER_COOKIE_DOMAIN'] = '.localhost.local'
+        with self.app.test_client() as c:
+            c.get('/login-notch-remember')
+            with c.session_transaction() as sess:
+                sess['user_id'] = None
+            c.set_cookie(domain, self.remember_cookie_name, 'foo')
+            result = c.get('/username')
+            self.assertEqual(u'Anonymous', result.data.decode('utf-8'))
 
     #
     # Session Protection
@@ -1114,46 +1259,161 @@ class LoginTestCase(unittest.TestCase):
             self.assertIsInstance(_ucp()['current_user'], AnonymousUserMixin)
 
 
+class LoginViaRequestTestCase(unittest.TestCase):
+    ''' Tests for LoginManager.request_loader.'''
+
+    def setUp(self):
+        self.app = Flask(__name__)
+        self.app.config['SECRET_KEY'] = 'deterministic'
+        self.app.config['SESSION_PROTECTION'] = None
+        self.remember_cookie_name = 'remember'
+        self.app.config['REMEMBER_COOKIE_NAME'] = self.remember_cookie_name
+        self.login_manager = LoginManager()
+        self.login_manager.init_app(self.app)
+        self.login_manager._login_disabled = False
+
+        @self.app.route('/')
+        def index():
+            return u'Welcome!'
+
+        @self.app.route('/login-notch')
+        def login_notch():
+            return unicode(login_user(notch))
+
+        @self.app.route('/username')
+        def username():
+            if current_user.is_authenticated:
+                return current_user.name
+            return u'Anonymous', 401
+
+        @self.app.route('/logout')
+        def logout():
+            return unicode(logout_user())
+
+        @self.login_manager.request_loader
+        def load_user_from_request(request):
+            user_id = request.args.get('user_id') or session.get('user_id')
+            try:
+                user_id = int(float(user_id))
+            except TypeError:
+                pass
+            return USERS.get(user_id)
+
+        # This will help us with the possibility of typoes in the tests. Now
+        # we shouldn't have to check each response to help us set up state
+        # (such as login pages) to make sure it worked: we will always
+        # get an exception raised (rather than return a 404 response)
+        @self.app.errorhandler(404)
+        def handle_404(e):
+            raise e
+
+        unittest.TestCase.setUp(self)
+
+    def test_has_no_user_loader_callback(self):
+        self.assertIsNone(self.login_manager._user_callback)
+
+    def test_request_context_users_are_anonymous(self):
+        with self.app.test_request_context():
+            self.assertTrue(current_user.is_anonymous)
+
+    def test_defaults_anonymous(self):
+        with self.app.test_client() as c:
+            result = c.get('/username')
+            self.assertEqual(result.status_code, 401)
+
+    def test_login_via_request(self):
+        user_id = 2
+        user_name = USERS[user_id].name
+        with self.app.test_client() as c:
+            url = '/username?user_id={user_id}'.format(user_id=user_id)
+            result = c.get(url)
+            self.assertEqual(user_name, result.data.decode('utf-8'))
+
+    def test_login_via_request_uses_cookie_when_already_logged_in(self):
+        user_id = 2
+        user_name = notch.name
+        with self.app.test_client() as c:
+            c.get('/login-notch')
+            url = '/username'
+            result = c.get(url)
+            self.assertEqual(user_name, result.data.decode('utf-8'))
+            url = '/username?user_id={user_id}'.format(user_id=user_id)
+            result = c.get(url)
+            self.assertEqual(u'Steve', result.data.decode('utf-8'))
+
+    def test_login_invalid_user_with_request(self):
+        user_id = 9000
+        with self.app.test_client() as c:
+            url = '/username?user_id={user_id}'.format(user_id=user_id)
+            result = c.get(url)
+            self.assertEqual(result.status_code, 401)
+
+    def test_login_invalid_user_with_request_when_already_logged_in(self):
+        user_id = 9000
+        with self.app.test_client() as c:
+            url = '/login-notch'
+            result = c.get(url)
+            self.assertEqual(u'True', result.data.decode('utf-8'))
+            url = '/username?user_id={user_id}'.format(user_id=user_id)
+            result = c.get(url)
+            self.assertEqual(result.status_code, 401)
+
+    def test_login_user_with_request_does_not_modify_session(self):
+        user_id = 2
+        user_name = USERS[user_id].name
+        with self.app.test_client() as c:
+            url = '/username?user_id={user_id}'.format(user_id=user_id)
+            result = c.get(url)
+            self.assertEqual(user_name, result.data.decode('utf-8'))
+            url = '/username'
+            result = c.get(url)
+            self.assertEqual(u'Anonymous', result.data.decode('utf-8'))
+
+
 class TestLoginUrlGeneration(unittest.TestCase):
-    def test_make_next_param(self):
-        self.assertEqual('/profile',
-                         make_next_param('/login', 'http://localhost/profile'))
+    def setUp(self):
+        self.app = Flask(__name__)
+        self.login_manager = LoginManager()
+        self.login_manager.init_app(self.app)
 
-        self.assertEqual('http://localhost/profile',
-                         make_next_param('https://localhost/login',
-                                         'http://localhost/profile'))
-
-        self.assertEqual('http://localhost/profile',
-                         make_next_param('http://accounts.localhost/login',
-                                         'http://localhost/profile'))
-
-    def test_login_url_generation(self):
-        PROTECTED = 'http://localhost/protected'
-
-        self.assertEqual('/login?n=%2Fprotected', login_url('/login',
-                                                            PROTECTED, 'n'))
-
-        self.assertEqual('/login?next=%2Fprotected', login_url('/login',
-                                                               PROTECTED))
-
-        expected = 'https://auth.localhost/login' + \
-                   '?next=http%3A%2F%2Flocalhost%2Fprotected'
-        self.assertEqual(expected,
-                         login_url('https://auth.localhost/login', PROTECTED))
-
-        self.assertEqual('/login?affil=cgnu&next=%2Fprotected',
-                         login_url('/login?affil=cgnu', PROTECTED))
-
-    def test_login_url_generation_with_view(self):
-        app = Flask(__name__)
-        login_manager = LoginManager()
-        login_manager.init_app(app)
-
-        @app.route('/login')
+        @self.app.route('/login')
         def login():
             return ''
 
-        with app.test_request_context():
+    def test_make_next_param(self):
+        with self.app.test_request_context():
+            url = make_next_param('/login', 'http://localhost/profile')
+            self.assertEqual('/profile', url)
+
+            url = make_next_param('https://localhost/login',
+                                  'http://localhost/profile')
+            self.assertEqual('http://localhost/profile', url)
+
+            url = make_next_param('http://accounts.localhost/login',
+                                  'http://localhost/profile')
+            self.assertEqual('http://localhost/profile', url)
+
+    def test_login_url_generation(self):
+        with self.app.test_request_context():
+            PROTECTED = 'http://localhost/protected'
+
+            self.assertEqual('/login?n=%2Fprotected', login_url('/login',
+                                                                PROTECTED,
+                                                                'n'))
+
+            url = login_url('/login', PROTECTED)
+            self.assertEqual('/login?next=%2Fprotected', url)
+
+            expected = 'https://auth.localhost/login' + \
+                '?next=http%3A%2F%2Flocalhost%2Fprotected'
+            result = login_url('https://auth.localhost/login', PROTECTED)
+            self.assertEqual(expected, result)
+
+            self.assertEqual('/login?affil=cgnu&next=%2Fprotected',
+                             login_url('/login?affil=cgnu', PROTECTED))
+
+    def test_login_url_generation_with_view(self):
+        with self.app.test_request_context():
             self.assertEqual('/login?next=%2Fprotected',
                              login_url('login', '/protected'))
 
@@ -1318,3 +1578,103 @@ class UnicodeCookieUserIDTestCase(unittest.TestCase):
             self._delete_session(c)
             result = c.get('/userid')
             self.assertEqual(u'佐藤', result.data.decode('utf-8'))
+
+
+class StrictHostForRedirectsTestCase(unittest.TestCase):
+    def setUp(self):
+        self.app = Flask(__name__)
+        self.app.config['SECRET_KEY'] = 'deterministic'
+        self.app.config['SESSION_PROTECTION'] = None
+        self.remember_cookie_name = 'remember'
+        self.app.config['REMEMBER_COOKIE_NAME'] = self.remember_cookie_name
+        self.login_manager = LoginManager()
+        self.login_manager.init_app(self.app)
+        self.login_manager._login_disabled = False
+
+        @self.app.route('/secret')
+        def secret():
+            return self.login_manager.unauthorized()
+
+        @self.app.route('/')
+        def index():
+            return u'Welcome!'
+
+        @self.login_manager.user_loader
+        def load_user(user_id):
+            return USERS[unicode(user_id)]
+
+        # This will help us with the possibility of typoes in the tests. Now
+        # we shouldn't have to check each response to help us set up state
+        # (such as login pages) to make sure it worked: we will always
+        # get an exception raised (rather than return a 404 response)
+        @self.app.errorhandler(404)
+        def handle_404(e):
+            raise e
+
+        unittest.TestCase.setUp(self)
+
+    def test_unauthorized_uses_host_from_next_url(self):
+        self.login_manager.login_view = 'login'
+        self.app.config['FORCE_HOST_FOR_REDIRECTS'] = None
+
+        @self.app.route('/login')
+        def login():
+            return session.pop('next', '')
+
+        with self.app.test_client() as c:
+            result = c.get('/secret', base_url='http://foo.com')
+            self.assertEqual(result.status_code, 302)
+            self.assertEqual(result.location,
+                             'http://foo.com/login?next=%2Fsecret')
+
+    def test_unauthorized_uses_host_from_config_when_available(self):
+        self.login_manager.login_view = 'login'
+        self.app.config['FORCE_HOST_FOR_REDIRECTS'] = 'good.com'
+
+        @self.app.route('/login')
+        def login():
+            return session.pop('next', '')
+
+        with self.app.test_client() as c:
+            result = c.get('/secret', base_url='http://bad.com')
+            self.assertEqual(result.status_code, 302)
+            self.assertEqual(result.location,
+                             'http://good.com/login?next=%2Fsecret')
+
+    def test_unauthorized_uses_host_from_x_forwarded_for_header(self):
+        self.login_manager.login_view = 'login'
+        self.app.config['FORCE_HOST_FOR_REDIRECTS'] = None
+
+        @self.app.route('/login')
+        def login():
+            return session.pop('next', '')
+
+        with self.app.test_client() as c:
+            headers = {
+                'X-Forwarded-Host': 'proxy.com',
+            }
+            result = c.get('/secret',
+                           base_url='http://foo.com',
+                           headers=headers)
+            self.assertEqual(result.status_code, 302)
+            self.assertEqual(result.location,
+                             'http://proxy.com/login?next=%2Fsecret')
+
+    def test_unauthorized_ignores_host_from_x_forwarded_for_header(self):
+        self.login_manager.login_view = 'login'
+        self.app.config['FORCE_HOST_FOR_REDIRECTS'] = 'good.com'
+
+        @self.app.route('/login')
+        def login():
+            return session.pop('next', '')
+
+        with self.app.test_client() as c:
+            headers = {
+                'X-Forwarded-Host': 'proxy.com',
+            }
+            result = c.get('/secret',
+                           base_url='http://foo.com',
+                           headers=headers)
+            self.assertEqual(result.status_code, 302)
+            self.assertEqual(result.location,
+                             'http://good.com/login?next=%2Fsecret')
